@@ -135,7 +135,37 @@ const sampleConfig = `
   # tls_key = "/etc/telegraf/key.pem"
   ## Use TLS but skip chain & host verification
   # insecure_skip_verify = false
+
+  ### Enable_aggregate_query
+  #enable_agg_query = false
+  #
+  #[[inputs.elasticsearch.aggregations.Query]]
+  #MetricsName = "metrics_name"
+  #Indices = ["test"]
+  #Query = '''{
+  #        "size": 0,
+  #        "Query": {
+  #            "match_all": {}
+  #        },
+  #        "aggregations": {
+  #            "group1": {
+  #                "terms": {"field": "somefield"},
+  #                "aggregations": {
+  #                    "total": {
+  #                        "sum": {"field": "val"}
+  #                    }
+  #                }
+  #            }
+  #        }
+  #    }'''
 `
+
+type Query struct {
+	MetricsName string   `toml:"metrics_name"`
+	Indices     []string `toml:"indices"`
+	IsEQL       bool     `toml:"eql_query"`
+	Query       string   `toml:"query"`
+}
 
 // Elasticsearch is a plugin to read stats from one or many Elasticsearch
 // servers.
@@ -152,6 +182,11 @@ type Elasticsearch struct {
 	NodeStats                  []string          `toml:"node_stats"`
 	Username                   string            `toml:"username"`
 	Password                   string            `toml:"password"`
+
+	EnableAggregationQuery bool `toml:"enable_agg_query"`
+	// Aggregation queries config
+	Queries []*Query `toml:"query"`
+
 	tls.ClientConfig
 
 	client          *http.Client
@@ -274,6 +309,17 @@ func (e *Elasticsearch) Gather(acc telegraf.Accumulator) error {
 				return
 			}
 
+			if e.EnableAggregationQuery {
+
+				for _, query := range e.Queries {
+					if err := e.gatherQueryMetrics(s, query, acc); err != nil {
+						acc.AddError(fmt.Errorf(mask.ReplaceAllString(err.Error(), "http(s)://XXX:XXX@")))
+						// return // commented-out: if query fails check for other status
+					}
+				}
+
+			}
+
 			if e.ClusterHealth {
 				url = s + "/_cluster/health"
 				if e.ClusterHealthLevel != "" {
@@ -310,6 +356,19 @@ func (e *Elasticsearch) Gather(acc telegraf.Accumulator) error {
 
 	wg.Wait()
 	return nil
+}
+
+func (e *Elasticsearch) makePath(server string, index string, isEQL bool) string {
+
+	if isEQL {
+		url := server + fmt.Sprintf("/%s/_eql/search", index)
+		return url
+		//url := server + fmt.Sprintf("/_all/_eql/search")
+		//return url
+	} else {
+		url := server + fmt.Sprintf("/%s/%s/", index, "_search")
+		return url
+	}
 }
 
 func (e *Elasticsearch) createHTTPClient() (*http.Client, error) {
@@ -413,6 +472,119 @@ func (e *Elasticsearch) gatherNodeStats(url string, acc telegraf.Accumulator) er
 		}
 	}
 	return nil
+}
+
+func (e *Elasticsearch) gatherQueryMetrics(svr string, query *Query, acc telegraf.Accumulator) error {
+
+	if len(query.Indices) > 0 {
+		for _, index := range query.Indices {
+
+			measurementTime := time.Now()
+
+			metrics, err := e.queryIndex(svr, query, index)
+			if err != nil {
+				return err
+			}
+
+			tags := map[string]string{
+				"index": index,
+			}
+
+			if len(metrics) > 0 {
+				acc.AddFields(query.MetricsName, metrics, tags, measurementTime)
+			}
+		}
+	} else {
+		measurementTime := time.Now()
+		metrics, err := e.queryIndex(svr, query, "_all")
+		if err != nil {
+			return err
+		}
+
+		tags := map[string]string{
+			"index": "_all",
+		}
+		acc.AddFields(query.MetricsName, metrics, tags, measurementTime)
+	}
+	return nil
+}
+
+func (e *Elasticsearch) queryIndex(svr string, query *Query, index string) (map[string]interface{}, error) {
+
+	resp, err := e.search(svr, index, query)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// add measurement fields to accumulator
+	metrics, err := e.parseResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return metrics, nil
+}
+
+func (e *Elasticsearch) parseResponse(resp []byte) (map[string]interface{}, error) {
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(resp, &m); err != nil {
+		return nil, err
+	}
+
+	metrics := make(map[string]interface{})
+	if m["timed_out"] == false {
+		metrics["hits"] = m["hits"].(map[string]interface{})["total"]
+
+		if val, exists := m["aggregations"]; exists {
+
+			for key, value := range val.(map[string]interface{}) {
+				bucketMap := value.(map[string]interface{})
+
+				if buckets, exists := bucketMap["buckets"]; exists {
+					b := buckets.(map[string]interface{})
+
+					for bKey := range b {
+						metrics[key+"."+bKey] = b[bKey].(map[string]interface{})["doc_count"]
+					}
+				}
+			}
+		}
+	}
+
+	return metrics, nil
+}
+
+func (e *Elasticsearch) search(server string, index string, query *Query) ([]byte, error) {
+
+	req, err := http.NewRequest("GET",
+		e.makePath(server, index, query.IsEQL), strings.NewReader(query.Query))
+
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	if e.Username != "" || e.Password != "" {
+		req.SetBasicAuth(e.Username, e.Password)
+	}
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("elasticsearch: API responded with status-code %d for running query %s",
+			resp.StatusCode, query.MetricsName)
+	}
+
+	result, err := ioutil.ReadAll(resp.Body)
+	return result, err
 }
 
 func (e *Elasticsearch) gatherClusterHealth(url string, acc telegraf.Accumulator) error {
